@@ -94,7 +94,27 @@ void parse_payload(unsigned char* buf) {
   default:
     printf("Unknown response code %02X\n", buf[0]);
   }
-  printf("\n");
+  printf("\n\n");
+}
+
+void send_frame(int fd, unsigned char* payload, int len) {
+  int lcs = (0x100 - len) & 0xFF;
+  int sum = 0;
+  for (int i = 0; i < len; ++i) sum += payload[i];
+  int dcs = (0x100 - sum) & 0xFF;
+  int c = 0;
+  unsigned char frame[len + 7];
+  frame[c++] = 0x00;
+  frame[c++] = 0x00;
+  frame[c++] = 0xFF;
+  frame[c++] = len;
+  frame[c++] = lcs;
+  memcpy(frame+5, payload, len);
+  c += len;
+  frame[c++] = dcs;
+  frame[c++] = 0x00;
+  write(fd, frame, sizeof frame);
+  tcdrain(fd);
 }
 
 int main() {
@@ -117,61 +137,17 @@ int main() {
   write(fd, wake, sizeof wake);
   tcdrain(fd);
 
-  /* unsigned char tfi_data[] = { */
-  /*   0xD4, // TFI: host -> pn532 */
-  /*   0x14, // opcode: SAMConfiguration */
-  /*   0x01, // mode: normal, no SAM */
-  /*   0x14, // timeout, 50ms x 20 (ignored in normal mode) */
-  /*   0x01  // IRQ pin enabled */
-  /* }; */
-  /* int len = sizeof tfi_data; */
-  /* int lcs = (0x100 - len) & 0xFF; // length checksum */
-  /* int sum = 0; */
-  /* for (int i = 0; i < len; ++i) sum += tfi_data[i]; */
-  /* int dcs = (0x100 - sum) & 0xFF; */
-  /* printf("LEN=%02X LCS=%02X DCS=%02X\n", len, lcs, dcs); */
-
-  unsigned char frame[] = {
-    0x00, 0x00, 0xFF,              // preamble+start code
-    0x05, 0xFB,                    // LEN, LCS
-    0xD4, 0x14, 0x01, 0x14, 0x01,  // TFI + SAMConfiguration
-    0x02,                          // DCS
-    0x00                           // postamble
-  };
-  write(fd, frame, sizeof frame);
-  tcdrain(fd);
-
-  // expect:
-  // 00 00 FF 00 FF 00 = ACK
-  // 00 00 FF   preamble + start code
-  // 02 FE      LEN, LCS
-  // D5         TFI: pn532 -> host
-  // 15         SAMConfiguration response (command 0x14 + 1 = 0x15)
-  // 16         DCS
-  // 00         postamble
   unsigned char buf[256];
+  unsigned char payload[256];
+  memcpy(payload, (unsigned char[]){0xD4, 0x14, 0x01, 0x14, 0x01}, 5);
+  send_frame(fd, payload, 5);
   if (read_frame(fd, buf)) {
     return 1;
   }
   parse_payload(buf);
 
-  // poll for card
-  unsigned char poll[] = {
-    0x00, 0x00, 0xFF,  // preamble + start code
-    0x04, 0xFC,        // LEN, LCS
-    0xD4,              // TFI: host -> pn532
-    0x4A,              // opcode: InListPassiveTarget
-    0x01,              // MaxTg: report at most 1 target
-    0x00,              // BrTy: 106 kbps ISO14443-A
-    0xE1,              // DCS
-    0x00               // postamble
-  };
-  write(fd, poll, sizeof poll);
-  tcdrain(fd);
-
-  /* for (int j = 0; j < 6; ++j) printf("%02X ", buf[j]); */
-  printf("\n");
-
+  memcpy(payload, (unsigned char[]){0xD4, 0x4A, 0x01, 0x00}, 4);
+  send_frame(fd, payload, 4);
   if (read_frame(fd, buf)) {
     return 1;
   }
