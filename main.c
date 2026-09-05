@@ -66,35 +66,85 @@ int read_frame(int fd, unsigned char* buf) {
   return 0;
 }
 
-void parse_payload(unsigned char* buf) {
+// generic payload parser for non-page card contents
+int parse_payload(unsigned char* buf) {
   int c = 0;
   switch (buf[c++]) {
-  case 0x15:
-    printf("SAMConfiguration Success");
-    break;
+    case 0x15:
+      printf("SAMConfiguration Success");
+      break;
 
-  case 0x4B:
-    printf("Opcode: InListPassiveTarget\n");
-    int nbtg = buf[c];
-    printf("NbTg: %02X\n", buf[c++]);
-    for (int i = 0; i < nbtg; ++i) {
-      printf("Tg: %02X\n", buf[c++]);
-      printf("    SENS_RES: %02X", buf[c++]);
-      printf("%02X\n", buf[c++]);
-      printf("    SEL_RES: %02X\n", buf[c++]);
-      int idlen = buf[c];
-      printf("    NFCIDLength: %02X\n", buf[c++]);
-      printf("    NFCID1: ");
-      for (int j = 0; j < idlen; ++j) {
-        printf("%02X ", buf[c++]);
+    case 0x4B:
+      printf("Opcode: InListPassiveTarget\n");
+      int nbtg = buf[c];
+      printf("NbTg: %02X\n", buf[c++]);
+      for (int i = 0; i < nbtg; ++i) {
+        printf("Tg: %02X\n", buf[c++]);
+        printf("    SENS_RES: %02X", buf[c++]);
+        printf("%02X\n", buf[c++]);
+        printf("    SEL_RES: %02X\n", buf[c++]);
+        int idlen = buf[c];
+        printf("    NFCIDLength: %02X\n", buf[c++]);
+        printf("    NFCID1: ");
+        for (int j = 0; j < idlen; ++j) {
+          printf("%02X ", buf[c++]);
+        }
       }
-    }
-    break;
+      break;
 
-  default:
-    printf("Unknown response code %02X\n", buf[0]);
+    case 0x41:
+      printf("Opcode: InDataExchange");
+      break;
+
+    default:
+      printf("Unknown response code %02X\n", buf[0]);
   }
   printf("\n\n");
+}
+
+int parse_pages(unsigned char* buf, int page) {
+  int c = 0;
+
+  // return code
+  int code = buf[c++];
+  if (code == 0x41) {
+    printf("InDataExchange: ");
+  } else {
+    printf("Unexpected return code: %02X\n", code);
+    return 1;
+  }
+
+  // status
+  int status = buf[c++];
+  if (status == 0x00) {
+    printf("STATUS OK!\n");
+  } else {
+    printf("Unexpected status: %02X\n", status);
+    return 1;
+  }
+
+  // jump to page 3 byte 2
+  c += 12 + 2;
+  int size = buf[c];
+  switch (size) {
+    case 0x12:
+      printf("CARD TYPE: NTAG213\n");
+      break;
+
+    case 0x3E:
+      printf("CARD TYPE: NTAG215\n");
+      break;
+
+    case 0x6D:
+      printf("CARD TYPE: NTAG216\n");
+      break;
+
+    default:
+      printf("CARD TYPE: UNKNOWN\n");
+      printf("CC SIZE: %02X\n", size);
+  }
+
+  printf("SIZE: %d B\n", size * 8);
 }
 
 void send_frame(int fd, unsigned char* payload, int len) {
@@ -139,19 +189,23 @@ int main() {
 
   unsigned char buf[256];
   unsigned char payload[256];
+
+  // SAM config
   memcpy(payload, (unsigned char[]){0xD4, 0x14, 0x01, 0x14, 0x01}, 5);
   send_frame(fd, payload, 5);
-  if (read_frame(fd, buf)) {
-    return 1;
-  }
+  if (read_frame(fd, buf)) return 1;
   parse_payload(buf);
 
+  // InListPassiveTarget
   memcpy(payload, (unsigned char[]){0xD4, 0x4A, 0x01, 0x00}, 4);
   send_frame(fd, payload, 4);
-  if (read_frame(fd, buf)) {
-    return 1;
-  }
+  if (read_frame(fd, buf)) return 1;
   parse_payload(buf);
 
+  // read page 0
+  memcpy(payload, (unsigned char[]){0xD4, 0x40, 0x01, 0x30, 0x00}, 5);
+  send_frame(fd, payload, 5);
+  if (read_frame(fd, buf)) return 1;
+  parse_pages(buf, 0);
   return 0;
 }
