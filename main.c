@@ -13,7 +13,7 @@ void read_exact(int fd, int len, unsigned char* buf) {
 }
 
 // populates buf with the payload, and prints its contents
-int read_frame(int fd, unsigned char* buf) {
+int read_response(int fd, unsigned char* buf) {
   // read 6 byte preamble
   read_exact(fd, 6, buf);
   if (memcmp(buf, "\x00\x00\xFF\x00\xFF\x00", 6)) {
@@ -102,7 +102,53 @@ int parse_payload(unsigned char* buf) {
   printf("\n\n");
 }
 
-int parse_pages(unsigned char* buf, int page) {
+int read_ndef_memory(unsigned char* mem) {
+  if (mem[0] != 0x03) {
+    printf("Expected 0x03 at beginning of NDEF memory, got: %02X\n", mem[0]);
+    return 1;
+  }
+
+  int len = mem[1];
+  int c = 2;
+  int flags = mem[c++];
+  int SR = !!(flags & 0x10);
+  int IL = !!(flags & 0x08);
+  int ME = !!(flags & 0x40);
+  int TNF = flags & 0x07;
+  printf("SR=%d IL=%d ME=%d TNF=%d\n", SR, IL, ME, TNF);
+  // Only support IL = 0
+  if (IL != 0) {
+    printf("Unsupported IL.\n");
+    return 1;
+  }
+
+  int TL = mem[c++];
+  printf("TYPE LENGTH: %02X\n", TL);
+  if (TL != 1) {
+    printf("Unsupported type length.\n");
+    return 1;
+  }
+
+  int PL = mem[c++];
+  printf("PAYLOAD LENGTH: %02X\n", PL);
+  printf("TYPE: %c\n", mem[c++]);
+
+  int status = mem[c++];
+  printf("STATUS BYTE: %02X\n", status);
+  printf("\tENCODING: ");
+  (status & 0x80) ? printf("UTF-16\n") : printf("UTF-8\n");
+  int langlen = status & 0x3F;
+  printf("\tLANGLEN: %02X\n", langlen);
+  printf("\tLANGUAGE: %.*s\n", langlen, &mem[c]);
+  c += langlen;
+
+  printf("%.*s\n", PL - 1 - langlen, &mem[c]);
+
+  return 0;
+}
+
+// return the size of the data area in bytes
+int get_ntag_info(unsigned char* buf) {
   int c = 0;
 
   // return code
@@ -111,7 +157,7 @@ int parse_pages(unsigned char* buf, int page) {
     printf("InDataExchange: ");
   } else {
     printf("Unexpected return code: %02X\n", code);
-    return 1;
+    return -1;
   }
 
   // status
@@ -120,7 +166,7 @@ int parse_pages(unsigned char* buf, int page) {
     printf("STATUS OK!\n");
   } else {
     printf("Unexpected status: %02X\n", status);
-    return 1;
+    return -1;
   }
 
   // jump to page 3 byte 2
@@ -128,23 +174,25 @@ int parse_pages(unsigned char* buf, int page) {
   int size = buf[c];
   switch (size) {
     case 0x12:
-      printf("CARD TYPE: NTAG213\n");
+      printf("IC: NTAG213\n");
       break;
 
     case 0x3E:
-      printf("CARD TYPE: NTAG215\n");
+      printf("IC: NTAG215\n");
       break;
 
     case 0x6D:
-      printf("CARD TYPE: NTAG216\n");
+      printf("IC: NTAG216\n");
       break;
 
     default:
-      printf("CARD TYPE: UNKNOWN\n");
+      printf("IC: UNKNOWN\n");
       printf("CC SIZE: %02X\n", size);
   }
 
-  printf("SIZE: %d B\n", size * 8);
+  int memory_size = size * 8;
+  printf("NDEF MEMORY SIZE: %d B\n\n", memory_size);
+  return memory_size;
 }
 
 void send_frame(int fd, unsigned char* payload, int len) {
@@ -193,19 +241,34 @@ int main() {
   // SAM config
   memcpy(payload, (unsigned char[]){0xD4, 0x14, 0x01, 0x14, 0x01}, 5);
   send_frame(fd, payload, 5);
-  if (read_frame(fd, buf)) return 1;
+  if (read_response(fd, buf)) return 1;
   parse_payload(buf);
 
   // InListPassiveTarget
   memcpy(payload, (unsigned char[]){0xD4, 0x4A, 0x01, 0x00}, 4);
   send_frame(fd, payload, 4);
-  if (read_frame(fd, buf)) return 1;
+  if (read_response(fd, buf)) return 1;
   parse_payload(buf);
 
-  // read page 0
+  // get NTAG info
   memcpy(payload, (unsigned char[]){0xD4, 0x40, 0x01, 0x30, 0x00}, 5);
   send_frame(fd, payload, 5);
-  if (read_frame(fd, buf)) return 1;
-  parse_pages(buf, 0);
+  if (read_response(fd, buf)) return 1;
+  int memory_size = get_ntag_info(buf);
+
+
+  unsigned char ndef_memory[1024];
+  for (int i = 16; i < memory_size; i += 16) { // 4 pages per query
+    memcpy(payload, (unsigned char[]){0xD4, 0x40, 0x01, 0x30, i/4}, 5);
+    send_frame(fd, payload, 5);
+    if (read_response(fd, buf)) return 1;
+
+    // copy respones into ndef_memory
+    int offset = i - 16;
+    memcpy(ndef_memory + offset, buf + 2, 16);
+  }
+
+  if (read_ndef_memory(ndef_memory)) return 1;
+
   return 0;
 }
