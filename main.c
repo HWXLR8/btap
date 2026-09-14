@@ -4,10 +4,12 @@
 #include <unistd.h>
 #include <string.h>
 
+#define PN532_PATH "/dev/ttyUSB0"
+
 void read_exact(int fd, int len, unsigned char* buf) {
   int got = 0;
   while (got != len) {
-    int r = read(fd, buf, len - got);
+    int r = read(fd, buf + got, len - got);
     got += r;
   }
 }
@@ -39,10 +41,10 @@ int read_response(int fd, unsigned char* buf) {
 
   // read TFI+data+DCS
   read_exact(fd, LEN+1, buf);
-  unsigned char TFI = buf[0];
+  // unsigned char TFI = buf[0];
   unsigned char data[LEN-1];
   memcpy(data, buf+1, LEN-1);
-  unsigned char DCS = buf[LEN];
+  // unsigned char DCS = buf[LEN];
   unsigned char sum = 0;
   for (int i = 0; i <= LEN; ++i) sum += buf[i];
   if (sum != 0) {
@@ -67,7 +69,7 @@ int read_response(int fd, unsigned char* buf) {
 }
 
 // generic payload parser for non-page card contents
-int parse_payload(unsigned char* buf) {
+void parse_payload(unsigned char* buf) {
   int c = 0;
   switch (buf[c++]) {
     case 0x15:
@@ -102,13 +104,13 @@ int parse_payload(unsigned char* buf) {
   printf("\n\n");
 }
 
-int read_ndef_memory(unsigned char* mem) {
+int read_ndef_memory(unsigned char* mem, char* mra_path) {
   if (mem[0] != 0x03) {
     printf("Expected 0x03 at beginning of NDEF memory, got: %02X\n", mem[0]);
     return 1;
   }
 
-  int len = mem[1];
+  // int len = mem[1];
   int c = 2;
   int flags = mem[c++];
   int SR = !!(flags & 0x10);
@@ -142,7 +144,12 @@ int read_ndef_memory(unsigned char* mem) {
   printf("\tLANGUAGE: %.*s\n", langlen, &mem[c]);
   c += langlen;
 
-  printf("%.*s\n", PL - 1 - langlen, &mem[c]);
+  int n = PL - 1 - langlen;
+  printf("%.*s\n", n, &mem[c]);
+
+  // store in mra_path
+  memcpy(mra_path, &mem[c], n);
+  mra_path[n] = '\0';
 
   return 0;
 }
@@ -215,60 +222,92 @@ void send_frame(int fd, unsigned char* payload, int len) {
   tcdrain(fd);
 }
 
-int main() {
-  int fd = open("/dev/ttyUSB0", O_RDWR | O_NOCTTY);
-  if (fd < 0) {
+int init(int* fd, unsigned char* buf, unsigned char* payload) {
+  *fd = open(PN532_PATH, O_RDWR | O_NOCTTY);
+  if (*fd < 0) {
     perror("open");
     return 1;
   }
 
   struct termios t;
-  tcgetattr(fd, &t);
+  tcgetattr(*fd, &t);
   cfmakeraw(&t);
   cfsetspeed(&t, B115200);
   t.c_cc[VMIN] = 0;
   t.c_cc[VTIME] = 1;
-  tcflush(fd, TCIFLUSH);
+  tcsetattr(*fd, TCSANOW, &t);
+  tcflush(*fd, TCIFLUSH);
 
   // wake up
   unsigned char wake[16] = {0x55};
-  write(fd, wake, sizeof wake);
-  tcdrain(fd);
-
-  unsigned char buf[256];
-  unsigned char payload[256];
+  write(*fd, wake, sizeof wake);
+  tcdrain(*fd);
 
   // SAM config
   memcpy(payload, (unsigned char[]){0xD4, 0x14, 0x01, 0x14, 0x01}, 5);
-  send_frame(fd, payload, 5);
-  if (read_response(fd, buf)) return 1;
+  send_frame(*fd, payload, 5);
+  if (read_response(*fd, buf)) return 1;
   parse_payload(buf);
 
+  return 0;
+}
+
+int poll(int* fd, unsigned char* buf, unsigned char* payload, char* mra_path) {
   // InListPassiveTarget
   memcpy(payload, (unsigned char[]){0xD4, 0x4A, 0x01, 0x00}, 4);
-  send_frame(fd, payload, 4);
-  if (read_response(fd, buf)) return 1;
+  send_frame(*fd, payload, 4);
+  if (read_response(*fd, buf)) return 1;
   parse_payload(buf);
 
   // get NTAG info
   memcpy(payload, (unsigned char[]){0xD4, 0x40, 0x01, 0x30, 0x00}, 5);
-  send_frame(fd, payload, 5);
-  if (read_response(fd, buf)) return 1;
+  send_frame(*fd, payload, 5);
+  if (read_response(*fd, buf)) return 1;
   int memory_size = get_ntag_info(buf);
 
 
+  // read NDEF memory, one page at a time
   unsigned char ndef_memory[1024];
   for (int i = 16; i < memory_size; i += 16) { // 4 pages per query
     memcpy(payload, (unsigned char[]){0xD4, 0x40, 0x01, 0x30, i/4}, 5);
-    send_frame(fd, payload, 5);
-    if (read_response(fd, buf)) return 1;
+    send_frame(*fd, payload, 5);
+    if (read_response(*fd, buf)) return 1;
 
     // copy respones into ndef_memory
     int offset = i - 16;
     memcpy(ndef_memory + offset, buf + 2, 16);
   }
 
-  if (read_ndef_memory(ndef_memory)) return 1;
+  if (read_ndef_memory(ndef_memory, mra_path)) return 1;
+
+  return 0;
+}
+
+int launch_game(char* mra_path) {
+  FILE *f = fopen("/dev/MiSTer_cmd", "w");
+  if (!f) { perror("/dev/MiSTer_cmd"); return 1; }
+  fprintf(f, "load_core %s\n", mra_path);
+  fclose(f);
+  return 0;
+}
+
+int main() {
+  int fd;
+  unsigned char buf[256];
+  unsigned char payload[256];
+  char mra_path[512];
+  char prev_mra[512] = {0};
+
+  init(&fd, buf, payload);
+
+  for (;;) {
+    poll(&fd, buf, payload, mra_path);
+    if (strcmp(mra_path, prev_mra) !=0) {
+      launch_game(mra_path);
+      strcpy((char*)prev_mra, mra_path);
+    }
+    usleep(200000); // 200ms
+  }
 
   return 0;
 }
